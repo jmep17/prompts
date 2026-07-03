@@ -15,6 +15,15 @@ Hard constraints:
 - Do not rewrite or degrade the HAR pipeline. It remains the source of truth for runtime-observed data and the only path for untyped code.
 - Every phase below must be independently shippable, and the static provider must be behind a feature flag until Phase 2 is proven.
 
+Feature flag behavior:
+
+- This is a local dev tool — use a plain config flag in the app's existing settings store (`staticExtraction.enabled`, default `false`), not a remote flag service. CLI equivalent: `--static` flag or `MOCKGEN_STATIC=1` env var.
+- Gate at **provider registration**: when the flag is off, the static provider is never instantiated and `ts-morph`/`typescript` are never loaded (lazy `import()` inside the provider — the dependency is heavy).
+- Tag every endpoint record with `source: "har" | "static" | "merged"`. Flag off ⇒ static and merged records are excluded from the UI and from mock serving; the HAR path behaves byte-for-byte as it does today. Turning the flag off must fully restore current behavior with no data migration — static records become inert, never destructive.
+- Phase 2 reconciliation sits behind a sub-flag (`staticExtraction.reconcile`) so enrichment-only mode (Phase 1) can ship and be evaluated independently.
+- CI runs the HAR golden tests in **both** flag states; flag-on with no static data must be indistinguishable from flag-off.
+- Flipping the default to `true` is its own release, after Phase 2 is validated — never bundled with feature work.
+
 Phased plan — do these in order, stop and ship after each:
 
 - **Phase 0 — shared model, no behavior change.** Define a provider-agnostic endpoint record (the JSON shape below) and refactor the HAR pipeline to emit it. Before touching anything, write golden tests over existing HAR fixtures so the refactor is provably behavior-preserving.
@@ -35,6 +44,51 @@ Reconciliation rules (the genuinely new logic):
 - HAR gives concrete URLs (`/api/users/42`); static gives patterns (`/api/users/:id`). Match by method + route-pattern matching; when a static pattern matches multiple HAR entries, they are the same endpoint.
 - Where both provide a schema and they disagree, do not silently pick a winner. Surface the disagreement in the record (`"schemaConflict": {...}`). Default policy: HAR wins for field presence and example values (it is ground truth of what actually flew); static wins for optionality, unions, and fields HAR happened not to capture.
 - Where static extraction yields `any`/unknown, fall back to the HAR-inferred schema — this is the existing behavior, unchanged.
+
+### Route pattern matching
+
+Use the existing `path-to-regexp` dependency as the matching primitive — do not write a custom matcher. The library only solves pattern → regex → test; the algorithm around it is:
+
+1. **Normalize both sides.** Strip origin/base URL from HAR entries (configurable base-URL list), drop query strings (store them separately on the record), normalize trailing slashes and case. On the static side, convert template literals (`` `/api/users/${id}` ``) to `:param` patterns before feeding path-to-regexp.
+2. **Direction:** for each concrete HAR URL, test against all static patterns with the same HTTP method.
+3. **Specificity ranking — the only custom code (~20 lines).** `/api/users/new` matches both the literal `/api/users/new` and `/api/users/:id`. Rank like a router: more literal segments wins, then fewer params, then longer pattern. Deterministic tie → pick first and emit a warning on the record so the ambiguity is visible, never silent.
+4. Unmatched HAR URLs remain concrete-URL endpoints (current behavior). Unreducible static call sites remain file+symbol orphans. Both are expected outcomes, not errors.
+
+### Schema conflict record shape
+
+Conflicts are per-field and JSON-pointer keyed — a whole-schema blob is useless to the UI. Compute them with a structural walk of both JSON Schemas, comparing at each pointer:
+
+```json
+{
+  "responseSchema": { "...merged result — what mock generation actually uses..." },
+  "schemaConflict": {
+    "detectedAt": "2026-07-03T12:00:00Z",
+    "harSampleCount": 14,
+    "conflicts": [
+      {
+        "path": "/properties/user/properties/age",
+        "kind": "type-mismatch",
+        "static": { "type": "number" },
+        "har": { "type": "string" },
+        "resolution": "har",
+        "overridden": false
+      }
+    ]
+  }
+}
+```
+
+`kind` values and default resolution:
+
+| kind | meaning | default winner |
+| --- | --- | --- |
+| `missing-in-static` | HAR saw the field, types don't declare it | HAR (types are stale) |
+| `missing-in-har` | declared, never observed | static (HAR sample bias is not proof of absence) |
+| `type-mismatch` | both present, types differ | HAR (ground truth) |
+| `optionality` | required vs sometimes-omitted disagreement | static |
+| `union-narrowing` | HAR only ever saw one union branch | static (keep the full union) |
+
+Rules: `responseSchema` is always the merged schema, so mock generation never interprets conflicts. `resolution: "manual"` marks a user override from the UI; overrides persist keyed by `endpointId + path` so deep regeneration never clobbers a user decision. `harSampleCount` lets the UI qualify confidence ("1 sample" vs "200 samples").
 
 ## Core insight
 
@@ -122,15 +176,15 @@ for (const sf of project.getSourceFiles("src/**/*.{ts,tsx}")) {
 }
 ```
 
-## Clever extras — implement these too
+## Clever extras — with the phase each belongs to
 
-- **Untyped calls fallback (two-pass strategy).** `fetch(...).then(r => r.json())` returns `any`; static analysis is a dead end there. Fall back to runtime capture: run the app with MSW in passthrough-record mode, capture real responses, and infer schemas from the captured JSON with `quicktype`. Use static extraction where the code is typed, runtime capture where it is not, and merge the results.
+- **Untyped calls fallback (Phase 2 — already exists, do not build).** `fetch(...).then(r => r.json())` returns `any`; static analysis is a dead end there. The HAR pipeline *is* the runtime-capture half of this strategy — do **not** build an MSW passthrough-record mode, that would duplicate it. This extra reduces entirely to the Phase 2 reconciliation rule: where static yields `any`/unknown, the HAR-inferred schema wins. Zero new capture code.
 
-- **Synthetic type trick for stubborn cases.** When unwrapping fails (deeply generic wrappers, conditional types), create an in-memory source file containing `type __Extract = Awaited<ReturnType<typeof theCall>>` and ask the checker to expand `__Extract`. The compiler performs all generic resolution for free.
+- **Synthetic type trick for stubborn cases (Phase 1, fallback branch only).** When unwrapping fails (deeply generic wrappers, conditional types), create an in-memory source file containing `type __Extract = Awaited<ReturnType<typeof theCall>>` and ask the checker to expand `__Extract`. The compiler performs all generic resolution for free. Works fine in the one-shot CLI — no warm program needed. Don't build it preemptively; add it when the fixture repo shows unwrap failures, and until then leave a reported "couldn't unwrap" branch.
 
-- **tRPC / GraphQL short-circuit.** Detect these frameworks first — the router or schema *is* the complete type inventory. Extract types directly from the tRPC router definition or the GraphQL schema/codegen output and skip AST walking entirely for those calls. Cheap, complete win.
+- **tRPC / GraphQL short-circuit (conditional — outside the phase ladder).** The router or schema *is* the complete type inventory, so extracting from it beats AST walking. But only build it if target repos actually use tRPC or GraphQL codegen. Phase 1 ships **detection only**: flag the dependency and report "N calls skipped (tRPC)". Build the real extractor as a follow-up only if that count is nonzero and users care.
 
-- **Reuse `ts-json-schema-generator`** for named/exported types — it already does the type→JSON Schema conversion well. Hand-roll the structural walker only for anonymous inferred types it cannot handle.
+- **Reuse `ts-json-schema-generator` (Phase 1, day one).** Not an add-on — it is *how* the type→JSON Schema step is done for named/exported types. Hand-roll the structural walker only for anonymous inferred types it cannot handle.
 
 ## Deliverables
 
