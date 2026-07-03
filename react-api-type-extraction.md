@@ -22,6 +22,14 @@ Phased plan — do these in order, stop and ship after each:
 - **Phase 2 — reconciliation + Regenerate integration.** Implement the conflict policy (below) and let the Regenerate button use the merged schema.
 - **Phase 3 — warm compiler service.** Long-lived program, file watcher, deep-regenerate mode. Only build this once Phases 1–2 have proven value; reroll mode needs none of it.
 
+Where the code lives:
+
+- The extraction engine is a **new package in the existing monorepo** (e.g. `packages/extraction`), alongside `cli`, `desktop`, and `shared`. Not a separate repo, and not a rewrite of any HAR code.
+- The provider-agnostic endpoint record and the `SchemaProvider` interface (Phase 0) go in `shared`. Both the HAR pipeline and the new engine implement/emit against those types.
+- `cli` gains a thin command wrapping the engine for Phase 1 one-shot scans. `desktop` consumes it through the provider interface from Phase 2 on.
+- Keep `typescript`/`ts-morph` as dependencies of `packages/extraction` only — never in `shared`, and never loaded in the desktop renderer. If the desktop app is Electron, run extraction in the main process or a child/worker process; the warm compiler program (Phase 3) especially must not live in the renderer.
+- Reuse the existing mock-gen pipeline pieces (schema store, faker/mock emission, fixture writing) rather than duplicating them; the engine's job ends at producing endpoint records with schemas.
+
 Reconciliation rules (the genuinely new logic):
 
 - HAR gives concrete URLs (`/api/users/42`); static gives patterns (`/api/users/:id`). Match by method + route-pattern matching; when a static pattern matches multiple HAR entries, they are the same endpoint.
