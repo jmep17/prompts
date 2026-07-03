@@ -4,6 +4,30 @@ You are building the extraction engine behind a mock-generation app. Given any R
 
 The app's UI lists every detected endpoint, and **each endpoint has a Regenerate button**. The engine must therefore support fast, targeted, per-endpoint regeneration — not just one-shot whole-repo extraction. Design everything below with that in mind.
 
+## Existing system context — read this first
+
+This is **not a greenfield build**. The application already works today using a HAR-based pipeline: recorded HTTP traffic is parsed into endpoint records and mock responses. That pipeline stays. Your job is to reorganize the project so static type extraction becomes a **second schema provider alongside HAR**, behind a shared interface — not a replacement engine.
+
+Note that the HAR pipeline is already the "runtime capture" half of the two-pass strategy described under Clever Extras below. You are adding the static half and a reconciliation layer, nothing more.
+
+Hard constraints:
+
+- Do not rewrite or degrade the HAR pipeline. It remains the source of truth for runtime-observed data and the only path for untyped code.
+- Every phase below must be independently shippable, and the static provider must be behind a feature flag until Phase 2 is proven.
+
+Phased plan — do these in order, stop and ship after each:
+
+- **Phase 0 — shared model, no behavior change.** Define a provider-agnostic endpoint record (the JSON shape below) and refactor the HAR pipeline to emit it. Before touching anything, write golden tests over existing HAR fixtures so the refactor is provably behavior-preserving.
+- **Phase 1 — static provider as one-shot enrichment.** A CLI (no service, no watcher, no warm compiler) that scans the repo and emits the same records. Merge with HAR records by endpoint ID; in the UI, static types appear as annotations on existing endpoints plus any endpoints HAR never saw.
+- **Phase 2 — reconciliation + Regenerate integration.** Implement the conflict policy (below) and let the Regenerate button use the merged schema.
+- **Phase 3 — warm compiler service.** Long-lived program, file watcher, deep-regenerate mode. Only build this once Phases 1–2 have proven value; reroll mode needs none of it.
+
+Reconciliation rules (the genuinely new logic):
+
+- HAR gives concrete URLs (`/api/users/42`); static gives patterns (`/api/users/:id`). Match by method + route-pattern matching; when a static pattern matches multiple HAR entries, they are the same endpoint.
+- Where both provide a schema and they disagree, do not silently pick a winner. Surface the disagreement in the record (`"schemaConflict": {...}`). Default policy: HAR wins for field presence and example values (it is ground truth of what actually flew); static wins for optionality, unions, and fields HAR happened not to capture.
+- Where static extraction yields `any`/unknown, fall back to the HAR-inferred schema — this is the existing behavior, unchanged.
+
 ## Core insight
 
 Do not parse or infer types yourself, and do not rely on regex to find API calls. Make the TypeScript compiler do both jobs — it already knows every inferred type in the project. Use `ts-morph` (a wrapper around the TypeScript compiler API), load the repo via its own `tsconfig.json`, and interrogate the type checker at each API call site.
