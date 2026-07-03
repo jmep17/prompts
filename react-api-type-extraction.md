@@ -1,0 +1,89 @@
+# Prompt: Extract API Response Types from a React Repo for Mock Generation
+
+You are building a tool that, given any React/TypeScript repository, detects every API call the app makes and extracts the TypeScript type of each response payload, so that realistic mocks can be generated automatically.
+
+## Core insight
+
+Do not parse or infer types yourself, and do not rely on regex to find API calls. Make the TypeScript compiler do both jobs — it already knows every inferred type in the project. Use `ts-morph` (a wrapper around the TypeScript compiler API), load the repo via its own `tsconfig.json`, and interrogate the type checker at each API call site.
+
+## Pipeline to implement
+
+1. **Find call sites by symbol resolution, not text matching.**
+   Grepping for `fetch` or `axios` breaks on wrappers and re-exports. Instead, walk every `CallExpression` in the AST and resolve the called expression's symbol back to its original declaration. This correctly catches:
+   - `import { api } from './client'` style wrappers around fetch/axios
+   - aliased or re-exported HTTP clients
+   - data-fetching hooks (`useQuery`, `useSWR`, `useMutation`, etc.)
+
+2. **Ask the type checker for the return type, then unwrap containers.**
+   Call `checker.getTypeAtLocation(callExpression)` and peel wrapper types until the payload type remains:
+   - `Promise<T>` → `T` (use the awaited type)
+   - `AxiosResponse<T>` → `T`
+   - `UseQueryResult<T>` / `{ data: T }` shapes → `T`
+
+   This works even when the type is fully *inferred* and never written down anywhere in the source.
+
+3. **Serialize the structural type to JSON Schema.**
+   Recursively walk `type.getProperties()`, handling unions, intersections, arrays, literal types, optionals, and enums. Track already-visited types to survive cycles (they exist in real codebases). JSON Schema is the target format because:
+   - `json-schema-faker` turns it directly into realistic mock data
+   - it is language-agnostic and easy to diff/version
+
+4. **Extract the request metadata alongside the type.**
+   For each call site, pull the URL argument (the checker can evaluate template literals to string literal types), the HTTP method, and the request body type if present. Emit one record per call site:
+
+   ```json
+   {
+     "file": "src/api/users.ts",
+     "line": 42,
+     "method": "GET",
+     "url": "/api/users/:id",
+     "responseSchema": { ... },
+     "requestBodySchema": { ... }
+   }
+   ```
+
+5. **Generate MSW handlers + mock data** from those records: one `http.get/post/...` handler per unique endpoint, with `json-schema-faker` producing the response body.
+
+## Reference skeleton
+
+```ts
+import { Project, Node } from "ts-morph";
+
+const project = new Project({ tsConfigFilePath: "tsconfig.json" });
+const checker = project.getTypeChecker();
+
+for (const sf of project.getSourceFiles("src/**/*.{ts,tsx}")) {
+  sf.forEachDescendant((node) => {
+    if (!Node.isCallExpression(node)) return;
+
+    const decl = node.getExpression().getSymbol()?.getDeclarations()?.[0];
+    if (!isApiCall(decl)) return; // does the symbol resolve to fetch/axios/known client?
+
+    // The compiler already inferred this — even with zero annotations
+    let t = checker.getTypeAtLocation(node);
+    while (t.getTypeArguments().length && isWrapper(t)) {
+      t = t.getTypeArguments()[0]; // unwrap Promise<T>, AxiosResponse<T>, { data: T }...
+    }
+
+    const schema = typeToJsonSchema(t, checker); // recursive getProperties() walk
+    const url = extractUrlArg(node, checker);    // checker evaluates template literals too
+  });
+}
+```
+
+## Clever extras — implement these too
+
+- **Untyped calls fallback (two-pass strategy).** `fetch(...).then(r => r.json())` returns `any`; static analysis is a dead end there. Fall back to runtime capture: run the app with MSW in passthrough-record mode, capture real responses, and infer schemas from the captured JSON with `quicktype`. Use static extraction where the code is typed, runtime capture where it is not, and merge the results.
+
+- **Synthetic type trick for stubborn cases.** When unwrapping fails (deeply generic wrappers, conditional types), create an in-memory source file containing `type __Extract = Awaited<ReturnType<typeof theCall>>` and ask the checker to expand `__Extract`. The compiler performs all generic resolution for free.
+
+- **tRPC / GraphQL short-circuit.** Detect these frameworks first — the router or schema *is* the complete type inventory. Extract types directly from the tRPC router definition or the GraphQL schema/codegen output and skip AST walking entirely for those calls. Cheap, complete win.
+
+- **Reuse `ts-json-schema-generator`** for named/exported types — it already does the type→JSON Schema conversion well. Hand-roll the structural walker only for anonymous inferred types it cannot handle.
+
+## Deliverables
+
+1. A CLI (`extract-api-types <repo-path>`) that emits the JSON records described above.
+2. A generator step that turns those records into an MSW handler file plus mock fixtures.
+3. Tests against a fixture repo covering: raw fetch, axios with generics, a wrapped client, react-query hooks, an untyped call (verifying the fallback path is reported), and a cyclic type.
+
+Key principle throughout: symbol resolution plus type-checker interrogation is the core mechanism. Regex finds roughly 60% of call sites; the compiler finds all of them, with types nobody had to write.
