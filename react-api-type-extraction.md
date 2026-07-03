@@ -1,6 +1,8 @@
 # Prompt: Extract API Response Types from a React Repo for Mock Generation
 
-You are building a tool that, given any React/TypeScript repository, detects every API call the app makes and extracts the TypeScript type of each response payload, so that realistic mocks can be generated automatically.
+You are building the extraction engine behind a mock-generation app. Given any React/TypeScript repository, the engine detects every API call the app makes and extracts the TypeScript type of each response payload, so that realistic mocks can be generated automatically.
+
+The app's UI lists every detected endpoint, and **each endpoint has a Regenerate button**. The engine must therefore support fast, targeted, per-endpoint regeneration — not just one-shot whole-repo extraction. Design everything below with that in mind.
 
 ## Core insight
 
@@ -32,16 +34,34 @@ Do not parse or infer types yourself, and do not rely on regex to find API calls
 
    ```json
    {
+     "id": "GET /api/users/:id",
      "file": "src/api/users.ts",
      "line": 42,
      "method": "GET",
      "url": "/api/users/:id",
      "responseSchema": { ... },
-     "requestBodySchema": { ... }
+     "requestBodySchema": { ... },
+     "schemaHash": "sha256:...",
+     "seed": 12345
    }
    ```
 
 5. **Generate MSW handlers + mock data** from those records: one `http.get/post/...` handler per unique endpoint, with `json-schema-faker` producing the response body.
+
+## Per-endpoint regeneration (drives the Regenerate button)
+
+Every endpoint record needs a **stable identity** so the UI button can target it. Derive the ID from `method + normalized URL pattern` (fall back to `file + symbol name` for dynamic URLs the checker can't reduce to a literal). The ID must survive unrelated edits to the file — never key on line numbers alone.
+
+The Regenerate button should support two modes:
+
+1. **Reroll (default, instant).** Keep the cached `responseSchema`, feed `json-schema-faker` a new seed, emit fresh mock data. No compiler involvement — this must return in milliseconds. Persist the seed per endpoint so a given mock is reproducible until the next reroll.
+
+2. **Deep regenerate (on demand / on file change).** Re-run type extraction for that endpoint only:
+   - Keep the `ts-morph` `Project` alive in memory (creating a program is the expensive part; re-checking one file is cheap).
+   - Refresh only the source file containing the call site (`sourceFile.refreshFromFileSystem()`), re-resolve the call expression, re-extract the schema.
+   - Compare `schemaHash` before/after — if unchanged, tell the UI "schema identical, data rerolled"; if changed, surface a schema diff so the user sees what their code change did.
+
+Expose this as a small API the app calls, e.g. `POST /endpoints/:id/regenerate { mode: "reroll" | "deep" }`, returning the updated record + mock payload. A file watcher can invalidate affected endpoints and mark them stale in the UI (badge on the button) rather than auto-regenerating.
 
 ## Reference skeleton
 
@@ -82,8 +102,12 @@ for (const sf of project.getSourceFiles("src/**/*.{ts,tsx}")) {
 
 ## Deliverables
 
-1. A CLI (`extract-api-types <repo-path>`) that emits the JSON records described above.
-2. A generator step that turns those records into an MSW handler file plus mock fixtures.
-3. Tests against a fixture repo covering: raw fetch, axios with generics, a wrapped client, react-query hooks, an untyped call (verifying the fallback path is reported), and a cyclic type.
+1. A long-lived extraction service (library + small HTTP API) that:
+   - performs the initial whole-repo scan and emits the JSON records described above,
+   - keeps the compiler program warm and serves `POST /endpoints/:id/regenerate` with both `reroll` and `deep` modes,
+   - watches source files and marks affected endpoints stale.
+2. A CLI wrapper (`extract-api-types <repo-path>`) over the same library for one-shot use.
+3. A generator step that turns those records into an MSW handler file plus mock fixtures.
+4. Tests against a fixture repo covering: raw fetch, axios with generics, a wrapped client, react-query hooks, an untyped call (verifying the fallback path is reported), a cyclic type, and regeneration (reroll changes data but not schema; deep regenerate after editing a type changes `schemaHash` and reports a diff; endpoint IDs stay stable across unrelated edits).
 
 Key principle throughout: symbol resolution plus type-checker interrogation is the core mechanism. Regex finds roughly 60% of call sites; the compiler finds all of them, with types nobody had to write.
